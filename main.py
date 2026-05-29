@@ -20,6 +20,8 @@ PUBLIC_BASE_URL = os.getenv(
     "https://fp-artwork-extractor-production.up.railway.app"
 ).rstrip("/")
 
+# Mount Railway Volume here:
+# Railway Volume Mount Path must be /app/output
 OUTPUT_DIR = Path("/app/output")
 TEMP_DIR = Path("/tmp/artwork-temp")
 
@@ -70,7 +72,7 @@ async def public_output_file(file_path: str):
     )
 
 
-def render_pdf_page(page, zoom=4):
+def render_pdf_page(page, zoom=3):
     matrix = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
     image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -87,7 +89,6 @@ def find_artwork_boxes(page_image):
 
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    # Looser detection for very light pastel boxes, like Item D.
     color_mask = (
         (saturation > 3) &
         (value > 35) &
@@ -99,7 +100,6 @@ def find_artwork_boxes(page_image):
 
     mask[color_mask & not_black & not_white] = 255
 
-    # Ignore only very top header.
     mask[: int(h * 0.20), :] = 0
 
     kernel = np.ones((17, 17), np.uint8)
@@ -118,7 +118,6 @@ def find_artwork_boxes(page_image):
         x, y, bw, bh = cv2.boundingRect(contour)
         area = bw * bh
 
-        # Allow smaller art boxes.
         if area < w * h * 0.004:
             continue
 
@@ -196,7 +195,6 @@ def extract_artwork_from_box(box_crop):
         axis=2,
     )
 
-    # More sensitive threshold for light pink-on-pink artwork.
     strong_diff = np.percentile(diff, 98)
     threshold = max(2, min(10, strong_diff * 0.18))
 
@@ -267,7 +265,7 @@ async def extract_artwork(file: UploadFile = File(...)):
             page_number = page_index + 1
             page = doc[page_index]
 
-            page_image = render_pdf_page(page, zoom=4)
+            page_image = render_pdf_page(page, zoom=3)
             boxes = find_artwork_boxes(page_image)
 
             for box_index, box in enumerate(boxes, start=1):
@@ -283,12 +281,13 @@ async def extract_artwork(file: UploadFile = File(...)):
                 save_transparent_png(artwork_rgba, png_path)
 
                 height, width = artwork_rgba.shape[:2]
+                url = f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}"
 
                 artworks.append({
                     "page": page_number,
                     "design_location_index": len(artworks) + 1,
-                    "artwork_url": f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}",
-                    "image_url": f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}",
+                    "artwork_url": url,
+                    "image_url": url,
                     "file": f"output/{job_id}/{filename}",
                     "local_path": str(png_path),
                     "exists": png_path.exists(),
