@@ -20,9 +20,10 @@ PUBLIC_BASE_URL = os.getenv(
     "https://fp-artwork-extractor-production.up.railway.app"
 ).rstrip("/")
 
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "output"
-TEMP_DIR = BASE_DIR / "temp"
+# Use persistent Railway volume path if mounted.
+# In Railway, mount your Volume to /app/output.
+OUTPUT_DIR = Path("/app/output")
+TEMP_DIR = Path("/tmp/artwork-temp")
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,7 @@ async def root():
         "status": "running",
         "public_base_url": PUBLIC_BASE_URL,
         "output_dir": str(OUTPUT_DIR),
+        "temp_dir": str(TEMP_DIR),
     }
 
 
@@ -62,6 +64,7 @@ async def public_output_file(file_path: str):
                 "detail": "File not found",
                 "requested_file": file_path,
                 "resolved_path": str(requested_path),
+                "output_dir": str(OUTPUT_DIR),
             },
         )
 
@@ -89,20 +92,16 @@ def find_artwork_boxes(page_image):
 
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    # Detect colored/pastel artwork boxes.
     color_mask = (
         (saturation > 6) &
         (value > 45) &
         (value < 252)
     )
 
-    # Exclude black background and white mockup areas.
     not_black = value > 35
     not_white = ~((saturation < 8) & (value > 245))
 
     mask[color_mask & not_black & not_white] = 255
-
-    # Ignore header/top branding area.
     mask[: int(h * 0.25), :] = 0
 
     kernel = np.ones((21, 21), np.uint8)
@@ -121,7 +120,6 @@ def find_artwork_boxes(page_image):
         x, y, bw, bh = cv2.boundingRect(contour)
         area = bw * bh
 
-        # Allow smaller artwork boxes like shorts/leg designs.
         if area < w * h * 0.008:
             continue
 
@@ -133,13 +131,11 @@ def find_artwork_boxes(page_image):
 
         aspect = bw / max(bh, 1)
 
-        # Avoid skinny text/color swatches.
         if aspect < 0.25 or aspect > 5.5:
             continue
 
         boxes.append((x, y, bw, bh))
 
-    # Remove boxes contained inside bigger boxes.
     filtered = []
 
     for box in boxes:
@@ -201,7 +197,6 @@ def extract_artwork_from_box(box_crop):
         axis=2,
     )
 
-    # Adaptive threshold for faint art on pastel boxes.
     strong_diff = np.percentile(diff, 98)
     threshold = max(4, min(14, strong_diff * 0.30))
 
@@ -213,7 +208,6 @@ def extract_artwork_from_box(box_crop):
 
     ys, xs = np.where(mask > 0)
 
-    # Blank box or no detectable artwork.
     if len(xs) < 30 or len(ys) < 30:
         return None
 
@@ -223,7 +217,6 @@ def extract_artwork_from_box(box_crop):
     crop_w = x2 - x1
     crop_h = y2 - y1
 
-    # Skip tiny noise/swatch dots.
     if crop_w < w * 0.04 or crop_h < h * 0.04:
         return None
 
@@ -295,6 +288,7 @@ async def extract_artwork(file: UploadFile = File(...)):
                     "page": page_number,
                     "design_location_index": len(artworks) + 1,
                     "artwork_url": f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}",
+                    "image_url": f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}",
                     "file": f"output/{job_id}/{filename}",
                     "local_path": str(png_path),
                     "exists": png_path.exists(),
@@ -315,6 +309,7 @@ async def extract_artwork(file: UploadFile = File(...)):
 
     return {
         "job_id": job_id,
+        "output_dir": str(OUTPUT_DIR),
         "artworks_found": len(artworks),
         "artworks": artworks,
     }
