@@ -74,90 +74,25 @@ def render_page(page, zoom=3):
     return np.array(image)
 
 
-def crop_nonwhite_region(page_image):
-    """
-    Fallback for banner/signage PDFs.
-    Crops the main artwork area and avoids bottom print-details text.
-    """
-
+def find_lower_artwork_box(page_image):
     h, w = page_image.shape[:2]
 
-    # Ignore bottom details area.
-    work = page_image.copy()
-    work[int(h * 0.82):, :] = 255
-
-    gray = cv2.cvtColor(work, cv2.COLOR_RGB2GRAY)
-
-    # Anything not close to white is content.
-    mask = (gray < 245).astype(np.uint8) * 255
-
-    # Remove top header area.
-    mask[: int(h * 0.08), :] = 0
-
-    kernel = np.ones((9, 9), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-
-    candidates = []
-
-    for contour in contours:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        area = bw * bh
-
-        if area < w * h * 0.08:
-            continue
-
-        if bw < w * 0.20 or bh < h * 0.20:
-            continue
-
-        candidates.append((x, y, bw, bh))
-
-    if not candidates:
-        return None
-
-    x, y, bw, bh = sorted(candidates, key=lambda b: b[2] * b[3], reverse=True)[0]
-
-    pad = 10
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(w, x + bw + pad)
-    y2 = min(h, y + bh + pad)
-
-    return page_image[y1:y2, x1:x2]
-
-
-def find_apparel_box(page_image):
-    """
-    Finds lower artwork box in apparel proofs.
-    """
-
-    h, w = page_image.shape[:2]
-
-    search_y1 = int(h * 0.38)
-    search = page_image[search_y1:, :]
-
-    hsv = cv2.cvtColor(search, cv2.COLOR_RGB2HSV)
+    hsv = cv2.cvtColor(page_image, cv2.COLOR_RGB2HSV)
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
 
-    mask = np.zeros(search.shape[:2], dtype=np.uint8)
+    mask = np.zeros((h, w), dtype=np.uint8)
 
-    mask[
-        (sat > 3) &
-        (val > 30) &
-        (val < 255)
-    ] = 255
+    # Find colored/pastel solid boxes.
+    mask[(sat > 3) & (val > 30) & (val < 255)] = 255
 
-    white = (sat < 6) & (val > 245)
-    black = val < 25
-    mask[white | black] = 0
+    # Remove white page and black background.
+    mask[((sat < 8) & (val > 245)) | (val < 25)] = 0
 
-    kernel = np.ones((25, 25), np.uint8)
+    # Only search the lower half where the proof artwork box lives.
+    mask[: int(h * 0.48), :] = 0
+
+    kernel = np.ones((35, 35), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
@@ -171,34 +106,33 @@ def find_apparel_box(page_image):
 
     for contour in contours:
         x, y, bw, bh = cv2.boundingRect(contour)
-        y = y + search_y1
-
         area = bw * bh
+        page_area = w * h
 
-        if area < w * h * 0.012:
+        if area < page_area * 0.025:
             continue
 
-        if bw < w * 0.10 or bh < h * 0.07:
+        if bw < w * 0.35 or bh < h * 0.15:
             continue
 
         aspect = bw / max(bh, 1)
-
-        if aspect < 0.25 or aspect > 4.5:
+        if aspect < 0.35 or aspect > 4.5:
             continue
 
         fill_ratio = cv2.contourArea(contour) / max(area, 1)
-
-        if fill_ratio < 0.45:
+        if fill_ratio < 0.55:
             continue
 
-        candidates.append((x, y, bw, bh))
+        candidates.append((x, y, bw, bh, area))
 
     if not candidates:
         return None
 
-    # Prefer lower artwork box, not garment mockup.
-    candidates = sorted(candidates, key=lambda b: (b[1], -b[2] * b[3]))
-    return candidates[0]
+    # Largest lower solid rectangle = artwork proof box.
+    candidates.sort(key=lambda b: b[4], reverse=True)
+    x, y, bw, bh, _ = candidates[0]
+
+    return (x, y, bw, bh)
 
 
 def crop_inside_box(page_image, box):
@@ -215,15 +149,11 @@ def crop_inside_box(page_image, box):
     return page_image[y1:y2, x1:x2]
 
 
-def extract_artwork_from_apparel_box(box_crop):
-    """
-    Removes solid colored box background and keeps only low-contrast artwork.
-    """
-
+def extract_logo_from_box(box_crop):
     rgb = box_crop
     h, w = rgb.shape[:2]
 
-    sample = max(10, min(h, w) // 18)
+    sample = max(12, min(h, w) // 16)
 
     corners = np.vstack([
         rgb[:sample, :sample].reshape(-1, 3),
@@ -239,25 +169,50 @@ def extract_artwork_from_apparel_box(box_crop):
         axis=2,
     )
 
-    p95 = np.percentile(diff, 95)
-    p98 = np.percentile(diff, 98)
+    # Low contrast sensitive, but not so low that it selects the whole box.
+    p90 = np.percentile(diff, 90)
+    p97 = np.percentile(diff, 97)
+    p99 = np.percentile(diff, 99)
 
-    threshold = max(1.5, min(10.0, ((p95 + p98) / 2) * 0.16))
+    threshold = max(2.0, min(12.0, (p97 + p99) * 0.12))
+
+    if p90 > 8:
+        threshold = max(threshold, p90 * 0.75)
 
     mask = (diff > threshold).astype(np.uint8) * 255
 
-    border_x = max(2, int(w * 0.018))
-    border_y = max(2, int(h * 0.018))
-
-    mask[:border_y, :] = 0
-    mask[-border_y:, :] = 0
-    mask[:, :border_x] = 0
-    mask[:, -border_x:] = 0
+    # Remove box edges.
+    bx = max(4, int(w * 0.025))
+    by = max(4, int(h * 0.025))
+    mask[:by, :] = 0
+    mask[-by:, :] = 0
+    mask[:, :bx] = 0
+    mask[:, -bx:] = 0
 
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((4, 4), np.uint8))
 
-    ys, xs = np.where(mask > 0)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+
+    cleaned = np.zeros_like(mask)
+
+    for label in range(1, num_labels):
+        x, y, bw, bh, area = stats[label]
+
+        # Remove tiny noise.
+        if area < 30:
+            continue
+
+        # Remove giant accidental background selections.
+        if area > w * h * 0.65:
+            continue
+
+        if bw < 4 or bh < 4:
+            continue
+
+        cleaned[labels == label] = 255
+
+    ys, xs = np.where(cleaned > 0)
 
     if len(xs) < 10 or len(ys) < 10:
         return None
@@ -271,8 +226,8 @@ def extract_artwork_from_apparel_box(box_crop):
     if crop_w < w * 0.015 or crop_h < h * 0.015:
         return None
 
-    pad_x = max(8, int(crop_w * 0.10))
-    pad_y = max(8, int(crop_h * 0.12))
+    pad_x = max(10, int(crop_w * 0.08))
+    pad_y = max(10, int(crop_h * 0.08))
 
     x1 = max(0, x1 - pad_x)
     y1 = max(0, y1 - pad_y)
@@ -280,7 +235,7 @@ def extract_artwork_from_apparel_box(box_crop):
     y2 = min(h, y2 + pad_y)
 
     cropped_rgb = rgb[y1:y2, x1:x2]
-    cropped_alpha = mask[y1:y2, x1:x2]
+    cropped_alpha = cleaned[y1:y2, x1:x2]
 
     return np.dstack([
         cropped_rgb[:, :, 0],
@@ -290,8 +245,55 @@ def extract_artwork_from_apparel_box(box_crop):
     ])
 
 
+def crop_banner_artboard(page_image):
+    h, w = page_image.shape[:2]
+
+    work = page_image.copy()
+    work[: int(h * 0.08), :] = 255
+    work[int(h * 0.84):, :] = 255
+
+    gray = cv2.cvtColor(work, cv2.COLOR_RGB2GRAY)
+    mask = (gray < 245).astype(np.uint8) * 255
+
+    kernel = np.ones((9, 9), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    candidates = []
+
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area = bw * bh
+
+        if area < w * h * 0.10:
+            continue
+
+        if bw < w * 0.20 or bh < h * 0.20:
+            continue
+
+        candidates.append((x, y, bw, bh, area))
+
+    if not candidates:
+        return None
+
+    x, y, bw, bh, _ = sorted(candidates, key=lambda b: b[4], reverse=True)[0]
+
+    pad = 8
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(w, x + bw + pad)
+    y2 = min(h, y + bh + pad)
+
+    return page_image[y1:y2, x1:x2]
+
+
 def save_image(image_array, path):
-    if image_array.shape[2] == 4:
+    if image_array.ndim == 3 and image_array.shape[2] == 4:
         Image.fromarray(image_array, mode="RGBA").save(path)
     else:
         Image.fromarray(image_array, mode="RGB").save(path)
@@ -314,67 +316,64 @@ async def extract_artwork(file: UploadFile = File(...)):
     try:
         doc = fitz.open(str(uploaded_pdf_path))
 
-        page_indexes = list(range(min(len(doc), 3)))
+        artwork = None
+        source_page = None
+        extraction_type = None
 
-        for page_index in page_indexes:
-            page = doc[page_index]
-            page_number = page_index + 1
+        # Apparel proof: page 2 usually has the clean large artwork box.
+        apparel_page_order = []
+        if len(doc) > 1:
+            apparel_page_order.append(1)
+        apparel_page_order.append(0)
 
-            page_image = render_page(page, zoom=3)
+        for page_index in apparel_page_order:
+            page_image = render_page(doc[page_index], zoom=3)
+            box = find_lower_artwork_box(page_image)
 
-            # First try apparel lower box extraction.
-            apparel_box = find_apparel_box(page_image)
+            if not box:
+                continue
 
-            if apparel_box:
-                box_crop = crop_inside_box(page_image, apparel_box)
-                artwork = extract_artwork_from_apparel_box(box_crop)
+            box_crop = crop_inside_box(page_image, box)
+            logo = extract_logo_from_box(box_crop)
 
-                if artwork is not None:
-                    filename = f"artwork_page_{page_number}_1.png"
-                    png_path = job_dir / filename
-                    save_image(artwork, png_path)
+            if logo is not None:
+                artwork = logo
+                source_page = page_index + 1
+                extraction_type = "apparel_logo_only"
+                break
 
-                    height, width = artwork.shape[:2]
-                    url = f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}"
+        # Banner/signage fallback.
+        if artwork is None:
+            for page_index in range(min(len(doc), 3)):
+                page_image = render_page(doc[page_index], zoom=3)
+                artboard = crop_banner_artboard(page_image)
 
-                    artworks.append({
-                        "page": page_number,
-                        "design_location_index": 1,
-                        "artwork_url": url,
-                        "image_url": url,
-                        "file": f"output/{job_id}/{filename}",
-                        "local_path": str(png_path),
-                        "exists": png_path.exists(),
-                        "width": width,
-                        "height": height,
-                        "extraction_type": "apparel_artwork_only",
-                    })
+                if artboard is not None:
+                    artwork = artboard
+                    source_page = page_index + 1
+                    extraction_type = "full_artboard_crop"
                     break
 
-            # Fallback for banner/artboard PDFs.
-            artboard = crop_nonwhite_region(page_image)
+        if artwork is not None:
+            filename = "artwork_page_1_1.png"
+            png_path = job_dir / filename
+            save_image(artwork, png_path)
 
-            if artboard is not None:
-                filename = f"artwork_page_{page_number}_1.png"
-                png_path = job_dir / filename
-                save_image(artboard, png_path)
+            height, width = artwork.shape[:2]
+            url = f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}"
 
-                height, width = artboard.shape[:2]
-                url = f"{PUBLIC_BASE_URL}/output/{job_id}/{filename}"
-
-                artworks.append({
-                    "page": page_number,
-                    "design_location_index": 1,
-                    "artwork_url": url,
-                    "image_url": url,
-                    "file": f"output/{job_id}/{filename}",
-                    "local_path": str(png_path),
-                    "exists": png_path.exists(),
-                    "width": width,
-                    "height": height,
-                    "extraction_type": "full_artboard_crop",
-                })
-                break
+            artworks.append({
+                "page": source_page,
+                "design_location_index": 1,
+                "artwork_url": url,
+                "image_url": url,
+                "file": f"output/{job_id}/{filename}",
+                "local_path": str(png_path),
+                "exists": png_path.exists(),
+                "width": width,
+                "height": height,
+                "extraction_type": extraction_type,
+            })
 
         doc.close()
 
